@@ -1,7 +1,8 @@
 import { Storage } from "@google-cloud/storage";
 import { createHash } from "node:crypto";
 import { readFileSync, readdirSync, existsSync } from "node:fs";
-import { join, relative } from "node:path";
+import { join, relative, basename, dirname } from "node:path";
+import { homedir } from "node:os";
 import { execSync } from "node:child_process";
 import "dotenv/config";
 
@@ -9,6 +10,73 @@ const PROJECT_ID = process.env.GCP_PROJECT_ID;
 const BUCKET_NAME = process.env.GCS_BUCKET_NAME;
 const REGION = process.env.GCS_REGION ?? "us-central1";
 const PROTOTYPES_DIR = join(__dirname, "prototypes");
+const CONFIG_PATH = join(__dirname, "mockups.config.json");
+
+interface Config {
+  sources?: string[];
+}
+
+function loadConfig(): Config {
+  if (!existsSync(CONFIG_PATH)) return {};
+  return JSON.parse(readFileSync(CONFIG_PATH, "utf8")) as Config;
+}
+
+function expandPath(p: string): string {
+  return p.startsWith("~/") ? join(homedir(), p.slice(2)) : p;
+}
+
+function isPrototypeDir(dir: string): boolean {
+  const entries = readdirSync(dir);
+  return (
+    entries.includes("package.json") || entries.some((f) => f.endsWith(".html"))
+  );
+}
+
+function collectSources(): Array<{ name: string; dir: string }> {
+  const config = loadConfig();
+  const extraSourcePaths = (config.sources ?? []).map(expandPath);
+
+  const seen = new Map<string, string>(); // name -> parent dir
+
+  // Built-in container: prototypes/ subdirs are each a prototype
+  if (existsSync(PROTOTYPES_DIR)) {
+    for (const entry of readdirSync(PROTOTYPES_DIR, { withFileTypes: true })) {
+      if (entry.isDirectory()) seen.set(entry.name, PROTOTYPES_DIR);
+    }
+  }
+
+  for (const sourcePath of extraSourcePaths) {
+    if (!existsSync(sourcePath)) {
+      console.warn(`Warning: source folder not found, skipping: ${sourcePath}`);
+      continue;
+    }
+    if (isPrototypeDir(sourcePath)) {
+      // The path itself is a prototype — use its basename as the name
+      const name = basename(sourcePath);
+      if (seen.has(name)) {
+        console.warn(
+          `Warning: duplicate prototype "${name}" at ${sourcePath}, using first occurrence (${seen.get(name)})`,
+        );
+      } else {
+        seen.set(name, dirname(sourcePath));
+      }
+    } else {
+      // The path is a container — each subdirectory is a prototype
+      for (const entry of readdirSync(sourcePath, { withFileTypes: true })) {
+        if (!entry.isDirectory()) continue;
+        if (seen.has(entry.name)) {
+          console.warn(
+            `Warning: duplicate prototype "${entry.name}" in ${sourcePath}, using first occurrence (${seen.get(entry.name)})`,
+          );
+        } else {
+          seen.set(entry.name, sourcePath);
+        }
+      }
+    }
+  }
+
+  return [...seen.entries()].map(([name, dir]) => ({ name, dir }));
+}
 
 if (!PROJECT_ID || !BUCKET_NAME) {
   console.error(
@@ -79,25 +147,25 @@ interface SyncResult {
   entryUrl: string | null;
 }
 
-async function syncPrototype(name: string): Promise<SyncResult> {
-  const protoDir = join(PROTOTYPES_DIR, name);
+async function syncPrototype(name: string, sourceDir: string): Promise<SyncResult> {
+  const protoDir = join(sourceDir, name);
 
   // Build if it's a package
-  let sourceDir = protoDir;
+  let buildDir = protoDir;
   if (existsSync(join(protoDir, "package.json"))) {
     process.stdout.write(`  building...`);
     execSync("npm install --silent && npm run build --silent", {
       cwd: protoDir,
     });
-    sourceDir = existsSync(join(protoDir, "dist"))
+    buildDir = existsSync(join(protoDir, "dist"))
       ? join(protoDir, "dist")
       : join(protoDir, "build");
     process.stdout.write(" ");
   }
 
   // Collect local files and compute remote paths
-  const localFiles = walkFiles(sourceDir);
-  const rootHtmlFiles = readdirSync(sourceDir).filter((f) =>
+  const localFiles = walkFiles(buildDir);
+  const rootHtmlFiles = readdirSync(buildDir).filter((f) =>
     f.endsWith(".html"),
   );
   // A single non-index HTML file gets normalized to index.html on upload
@@ -109,7 +177,7 @@ async function syncPrototype(name: string): Promise<SyncResult> {
   // localAbsPath -> gcsObjectName
   const fileMap = new Map<string, string>();
   for (const localPath of localFiles) {
-    const rel = relative(sourceDir, localPath).replace(/\\/g, "/");
+    const rel = relative(buildDir, localPath).replace(/\\/g, "/");
     const gcsName =
       singleHtml && rel === singleHtml
         ? `${name}/index.html`
@@ -161,10 +229,8 @@ async function main() {
   const userEmail = await getAdcEmail();
   await ensureBucket(userEmail);
 
-  const protoNames = readdirSync(PROTOTYPES_DIR, { withFileTypes: true })
-    .filter((e) => e.isDirectory())
-    .map((e) => e.name);
-  const protoSet = new Set(protoNames);
+  const prototypes = collectSources();
+  const protoSet = new Set(prototypes.map((p) => p.name));
 
   // Remove GCS prefixes for locally deleted prototypes
   const [allGcsFiles] = await bucket.getFiles();
@@ -181,9 +247,9 @@ async function main() {
 
   const updated: Array<{ name: string; url: string }> = [];
 
-  for (const name of protoNames) {
+  for (const { name, dir } of prototypes) {
     process.stdout.write(`${name}... `);
-    const { changed, entryUrl } = await syncPrototype(name);
+    const { changed, entryUrl } = await syncPrototype(name, dir);
     if (!changed) {
       console.log("no changes");
     } else if (entryUrl) {
