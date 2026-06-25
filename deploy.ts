@@ -1,7 +1,7 @@
 import { Storage } from "@google-cloud/storage";
 import { createHash } from "node:crypto";
 import { readFileSync, readdirSync, existsSync } from "node:fs";
-import { join, relative, basename, dirname } from "node:path";
+import { join, relative, basename } from "node:path";
 import { homedir } from "node:os";
 import { execSync } from "node:child_process";
 import "dotenv/config";
@@ -12,8 +12,10 @@ const REGION = process.env.GCS_REGION ?? "us-central1";
 const PROTOTYPES_DIR = join(__dirname, "prototypes");
 const CONFIG_PATH = join(__dirname, "mockups.config.json");
 
+type SourceEntry = string | { path: string; slug?: string };
+
 interface Config {
-  sources?: string[];
+  sources?: SourceEntry[];
 }
 
 function loadConfig(): Config {
@@ -32,50 +34,53 @@ function isPrototypeDir(dir: string): boolean {
   );
 }
 
-function collectSources(): Array<{ name: string; dir: string }> {
+function collectSources(): Array<{ slug: string; localPath: string }> {
   const config = loadConfig();
-  const extraSourcePaths = (config.sources ?? []).map(expandPath);
 
-  const seen = new Map<string, string>(); // name -> parent dir
+  const seen = new Map<string, string>(); // slug -> localPath
+
+  function add(slug: string, localPath: string) {
+    if (seen.has(slug)) {
+      console.warn(
+        `Warning: duplicate prototype "${slug}" at ${localPath}, using first occurrence`,
+      );
+    } else {
+      seen.set(slug, localPath);
+    }
+  }
 
   // Built-in container: prototypes/ subdirs are each a prototype
   if (existsSync(PROTOTYPES_DIR)) {
     for (const entry of readdirSync(PROTOTYPES_DIR, { withFileTypes: true })) {
-      if (entry.isDirectory()) seen.set(entry.name, PROTOTYPES_DIR);
+      if (entry.isDirectory()) add(entry.name, join(PROTOTYPES_DIR, entry.name));
     }
   }
 
-  for (const sourcePath of extraSourcePaths) {
+  for (const entry of config.sources ?? []) {
+    const rawPath = typeof entry === "string" ? entry : entry.path;
+    const slug = typeof entry === "object" ? entry.slug : undefined;
+    const sourcePath = expandPath(rawPath);
+
     if (!existsSync(sourcePath)) {
       console.warn(`Warning: source folder not found, skipping: ${sourcePath}`);
       continue;
     }
+
     if (isPrototypeDir(sourcePath)) {
-      // The path itself is a prototype — use its basename as the name
-      const name = basename(sourcePath);
-      if (seen.has(name)) {
-        console.warn(
-          `Warning: duplicate prototype "${name}" at ${sourcePath}, using first occurrence (${seen.get(name)})`,
-        );
-      } else {
-        seen.set(name, dirname(sourcePath));
-      }
+      // The path itself is a prototype
+      add(slug ?? basename(sourcePath), sourcePath);
     } else {
       // The path is a container — each subdirectory is a prototype
-      for (const entry of readdirSync(sourcePath, { withFileTypes: true })) {
-        if (!entry.isDirectory()) continue;
-        if (seen.has(entry.name)) {
-          console.warn(
-            `Warning: duplicate prototype "${entry.name}" in ${sourcePath}, using first occurrence (${seen.get(entry.name)})`,
-          );
-        } else {
-          seen.set(entry.name, sourcePath);
+      for (const sub of readdirSync(sourcePath, { withFileTypes: true })) {
+        if (sub.isDirectory()) {
+          const name = slug ? `${slug}-${sub.name}` : sub.name;
+          add(name, join(sourcePath, sub.name));
         }
       }
     }
   }
 
-  return [...seen.entries()].map(([name, dir]) => ({ name, dir }));
+  return [...seen.entries()].map(([slug, localPath]) => ({ slug, localPath }));
 }
 
 if (!PROJECT_ID || !BUCKET_NAME) {
@@ -131,15 +136,13 @@ async function ensureBucket(userEmail: string): Promise<void> {
   // - allUsers: public read for sharing URLs
   // - userEmail: admin so this script can upload and delete objects
   // Requires "Public Access Prevention" to be off (default for non-org GCP accounts).
-  await Promise.all([
-    bucket.iam.setPolicy({
-      bindings: [
-        { role: "roles/storage.objectViewer", members: ["allUsers"] },
-        { role: "roles/storage.admin", members: [`user:${userEmail}`] },
-      ],
-    }),
-    bucket.setMetadata({ labels: { owner: "michal", service: "claude" } }),
-  ]);
+  await bucket.iam.setPolicy({
+    bindings: [
+      { role: "roles/storage.objectViewer", members: ["allUsers"] },
+      { role: "roles/storage.admin", members: [`user:${userEmail}`] },
+    ],
+  });
+  await bucket.setMetadata({ labels: { owner: "michal", service: "claude" } });
 }
 
 interface SyncResult {
@@ -147,8 +150,9 @@ interface SyncResult {
   entryUrl: string | null;
 }
 
-async function syncPrototype(name: string, sourceDir: string): Promise<SyncResult> {
-  const protoDir = join(sourceDir, name);
+async function syncPrototype(slug: string, localPath: string): Promise<SyncResult> {
+  const protoDir = localPath;
+  const name = slug;
 
   // Build if it's a package
   let buildDir = protoDir;
@@ -230,7 +234,7 @@ async function main() {
   await ensureBucket(userEmail);
 
   const prototypes = collectSources();
-  const protoSet = new Set(prototypes.map((p) => p.name));
+  const protoSet = new Set(prototypes.map((p) => p.slug));
 
   // Remove GCS prefixes for locally deleted prototypes
   const [allGcsFiles] = await bucket.getFiles();
@@ -247,14 +251,14 @@ async function main() {
 
   const updated: Array<{ name: string; url: string }> = [];
 
-  for (const { name, dir } of prototypes) {
-    process.stdout.write(`${name}... `);
-    const { changed, entryUrl } = await syncPrototype(name, dir);
+  for (const { slug, localPath } of prototypes) {
+    process.stdout.write(`${slug}... `);
+    const { changed, entryUrl } = await syncPrototype(slug, localPath);
     if (!changed) {
       console.log("no changes");
     } else if (entryUrl) {
       console.log("updated");
-      updated.push({ name, url: entryUrl });
+      updated.push({ name: slug, url: entryUrl });
     } else {
       console.log("updated (no HTML entry point found)");
     }

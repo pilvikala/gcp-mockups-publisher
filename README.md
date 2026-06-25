@@ -69,16 +69,19 @@ To pull in prototypes stored outside this project (e.g. Claude project folders),
 ```json
 {
   "sources": [
-    "/Users/you/Documents/Claude/Projects/My Feature/prototype",
+    {
+      "path": "/Users/you/Documents/Claude/Projects/My Feature/prototype",
+      "slug": "my-feature"
+    },
     "/absolute/path/to/a-folder-of-mockups"
   ]
 }
 ```
 
-Each entry is auto-detected:
+Each entry can be a plain path string or an object with `path` and an optional `slug`. The folder is auto-detected:
 
-- **Single prototype** — if the folder itself contains `.html` files or a `package.json`, it's treated as one prototype. Its folder name becomes the GCS prefix.
-- **Container of prototypes** — otherwise, each subdirectory is treated as an individual prototype, exactly like `prototypes/`.
+- **Single prototype** — if the folder itself contains `.html` files or a `package.json`, it's treated as one prototype. The `slug` (or the folder name if omitted) becomes the GCS prefix.
+- **Container of prototypes** — otherwise, each subdirectory is treated as an individual prototype, exactly like `prototypes/`. `slug` is not applicable here.
 
 Paths starting with `~/` are expanded to your home directory. The built-in `prototypes/` folder is always included first.
 

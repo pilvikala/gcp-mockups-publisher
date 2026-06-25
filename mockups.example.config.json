@@ -1,0 +1,9 @@
+{
+  "sources": [
+    {
+      "path": "/Users/you/Documents/Claude/Projects/My Feature/prototype",
+      "slug": "my-feature"
+    },
+    "/absolute/path/to/a-folder-of-mockups"
+  ]
+}
