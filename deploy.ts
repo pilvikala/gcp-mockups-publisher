@@ -229,6 +229,40 @@ async function syncPrototype(slug: string, localPath: string): Promise<SyncResul
   };
 }
 
+async function uploadIndexHtml(
+  prototypes: Array<{ name: string; url: string }>,
+): Promise<string> {
+  const items = prototypes
+    .map(({ name, url }) => `      <li><a href="${url}">${name}</a></li>`)
+    .join("\n");
+
+  const html = `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Prototypes</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 600px; margin: 40px auto; padding: 0 20px; color: #111; }
+    h1 { font-size: 1.4rem; margin-bottom: 1.2rem; }
+    ul { list-style: none; padding: 0; }
+    li { margin: 10px 0; }
+    a { color: #0066cc; text-decoration: none; font-size: 1rem; }
+    a:hover { text-decoration: underline; }
+  </style>
+</head>
+<body>
+  <h1>Prototypes</h1>
+  <ul>
+${items}
+  </ul>
+</body>
+</html>`;
+
+  await bucket.file("index.html").save(html, { contentType: "text/html" });
+  return `https://storage.googleapis.com/${BUCKET_NAME}/index.html`;
+}
+
 async function main() {
   const userEmail = await getAdcEmail();
   await ensureBucket(userEmail);
@@ -236,12 +270,12 @@ async function main() {
   const prototypes = collectSources();
   const protoSet = new Set(prototypes.map((p) => p.slug));
 
-  // Remove GCS prefixes for locally deleted prototypes
+  // Remove GCS prefixes for locally deleted prototypes (skip root-level files like index.html)
   const [allGcsFiles] = await bucket.getFiles();
   const gcsProtoNames = new Set(
     allGcsFiles
       .map((f) => f.name.split("/")[0])
-      .filter((n) => n && !protoSet.has(n)),
+      .filter((n) => n && n !== "index.html" && !protoSet.has(n)),
   );
   for (const name of gcsProtoNames) {
     console.log(`${name}... removed`);
@@ -250,6 +284,7 @@ async function main() {
   }
 
   const updated: Array<{ name: string; url: string }> = [];
+  const allWithUrls: Array<{ name: string; url: string }> = [];
 
   for (const { slug, localPath } of prototypes) {
     process.stdout.write(`${slug}... `);
@@ -262,19 +297,21 @@ async function main() {
     } else {
       console.log("updated (no HTML entry point found)");
     }
+    if (entryUrl) allWithUrls.push({ name: slug, url: entryUrl });
   }
+
+  const indexUrl = await uploadIndexHtml(allWithUrls);
 
   if (updated.length === 0 && gcsProtoNames.size === 0) {
     console.log("\nNothing changed.");
-    return;
-  }
-
-  if (updated.length > 0) {
+  } else if (updated.length > 0) {
     console.log("\nUpdated:");
     for (const { name, url } of updated) {
       console.log(`  ${name}: ${url}`);
     }
   }
+
+  console.log(`\nIndex: ${indexUrl}`);
 }
 
 main().catch((err) => {
